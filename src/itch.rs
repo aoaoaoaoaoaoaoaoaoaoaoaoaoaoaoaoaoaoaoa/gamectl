@@ -65,7 +65,7 @@ pub(crate) enum ItchAction {
         force: bool,
     },
 
-    /// Download, install, and manifest-register one owned itch.io game.
+    /// Download, install, and record one owned itch.io game in the manifest.
     Install {
         game: String,
 
@@ -211,10 +211,7 @@ pub(crate) async fn run_itch(action: ItchAction, paths: &RuntimePaths) -> Result
                 manifest_game,
             )?;
             println!("installed {title} at {}", target.display());
-            println!(
-                "registered {game_slug} in {}",
-                paths.manifest_path.display()
-            );
+            println!("recorded {game_slug} in {}", paths.manifest_path.display());
             Ok(())
         }
     }

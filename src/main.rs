@@ -70,9 +70,6 @@ impl Cli {
                 show_game(&resolved, json)
             }
             Action::Store { command } => run_store(command, &paths).await,
-            Action::Register(args) => {
-                register_game(&paths.manifest_path, &paths.home, &paths.root, args)
-            }
             Action::Play {
                 game,
                 dry_run,
@@ -94,19 +91,6 @@ impl Cli {
                 fs::create_dir_all(&resolved.work_dir)?;
                 let invocation = resolved.hook_invocation(hook)?;
                 run_invocation(invocation, dry_run)
-            }
-            Action::Desktop {
-                game,
-                output,
-                print,
-            } => {
-                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
-                let resolved = manifest.resolve_game(&game)?;
-                write_desktop_entry(&resolved, &paths.manifest_path, output, print, &paths.home)
-            }
-            Action::Paths => {
-                print_paths(&paths);
-                Ok(())
             }
         }
     }
@@ -149,7 +133,6 @@ impl Cli {
 #[derive(Debug)]
 pub(crate) struct RuntimePaths {
     pub(crate) home: PathBuf,
-    config_path: PathBuf,
     pub(crate) root: PathBuf,
     pub(crate) manifest_path: PathBuf,
 }
@@ -163,7 +146,6 @@ impl RuntimePaths {
         let manifest_path = cli.manifest_path(&config, &home, &root);
         Ok(Self {
             home,
-            config_path,
             root,
             manifest_path,
         })
@@ -227,9 +209,6 @@ enum Action {
         json: bool,
     },
 
-    /// Add or replace one manifest entry.
-    Register(RegisterArgs),
-
     /// Install, update, and authenticate through game stores.
     Store {
         #[command(subcommand)]
@@ -258,22 +237,6 @@ enum Action {
         #[arg(long)]
         dry_run: bool,
     },
-
-    /// Generate a freedesktop .desktop launcher.
-    Desktop {
-        game: String,
-
-        /// Write to this path instead of ~/.local/share/applications.
-        #[arg(long)]
-        output: Option<PathBuf>,
-
-        /// Print the entry instead of writing it.
-        #[arg(long)]
-        print: bool,
-    },
-
-    /// Print default paths used by gamectl.
-    Paths,
 }
 
 #[derive(Debug, Subcommand)]
@@ -289,44 +252,6 @@ enum StoreAction {
         #[command(subcommand)]
         command: ItchAction,
     },
-}
-
-#[derive(Debug, Parser)]
-struct RegisterArgs {
-    id: String,
-
-    #[arg(long)]
-    title: Option<String>,
-
-    #[arg(long)]
-    source: Option<String>,
-
-    #[arg(long)]
-    install_dir: PathBuf,
-
-    #[arg(long)]
-    work_dir: Option<PathBuf>,
-
-    #[arg(long)]
-    launch: String,
-
-    #[arg(long = "arg")]
-    args: Vec<String>,
-
-    #[arg(long = "env", value_parser = parse_env_pair)]
-    env: Vec<(String, String)>,
-
-    #[arg(long = "tag")]
-    tags: Vec<String>,
-
-    #[arg(long)]
-    icon: Option<PathBuf>,
-
-    #[arg(long)]
-    terminal: bool,
-
-    #[arg(long)]
-    force: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -351,7 +276,7 @@ enum GogAction {
         json: bool,
     },
 
-    /// Download, verify, sandbox-extract, and manifest-register a GOG game.
+    /// Download, verify, sandbox-extract, and record a GOG game in the manifest.
     Install {
         product: String,
 
@@ -728,34 +653,6 @@ fn show_game(game: &ResolvedGame, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn register_game(path: &Path, home: &Path, fallback_root: &Path, args: RegisterArgs) -> Result<()> {
-    let mut manifest = Manifest::load(path, home, fallback_root)?;
-    if manifest.games.contains_key(&args.id) && !args.force {
-        bail!("`{}` already exists; pass --force to replace it", args.id);
-    }
-
-    let game = Game {
-        title: args.title,
-        source: args.source,
-        install_dir: args.install_dir,
-        work_dir: args.work_dir,
-        launch: CommandSpec::Program(PathText::from(args.launch)),
-        args: args.args.into_iter().map(PathText::from).collect(),
-        env: args.env.into_iter().collect(),
-        tags: args.tags,
-        icon: args.icon,
-        terminal: args.terminal,
-        install: None,
-        update: None,
-        repair: None,
-    };
-
-    let _old = manifest.games.insert(args.id.clone(), game);
-    manifest.save(path)?;
-    println!("{}", args.id);
-    Ok(())
-}
-
 fn upsert_manifest_game(
     path: &Path,
     home: &Path,
@@ -820,7 +717,7 @@ async fn run_gog(action: GogAction, paths: &RuntimePaths) -> Result<()> {
                 selection.installer.version,
                 install.target.display()
             );
-            println!("registered {game_id} in {}", paths.manifest_path.display());
+            println!("recorded {game_id} in {}", paths.manifest_path.display());
             Ok(())
         }
     }
@@ -1237,69 +1134,6 @@ fn init_manifest(path: &Path, root: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_paths(paths: &RuntimePaths) {
-    println!("config: {}", paths.config_path.display());
-    println!("manifest: {}", paths.manifest_path.display());
-    println!("root: {}", paths.root.display());
-}
-
-fn write_desktop_entry(
-    game: &ResolvedGame,
-    manifest_path: &Path,
-    output: Option<PathBuf>,
-    print: bool,
-    home: &Path,
-) -> Result<()> {
-    let entry = desktop_entry(game, manifest_path);
-    if print {
-        print!("{entry}");
-        return Ok(());
-    }
-
-    let output = output.map_or_else(
-        || {
-            home.join(".local")
-                .join("share")
-                .join("applications")
-                .join(format!("gamectl-{}.desktop", sanitize_filename(&game.id)))
-        },
-        |path| normalize_path(path, home, Path::new(".")),
-    );
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&output, entry)?;
-    println!("{}", output.display());
-    Ok(())
-}
-
-fn desktop_entry(game: &ResolvedGame, manifest_path: &Path) -> String {
-    let mut entry = String::new();
-    entry.push_str("[Desktop Entry]\n");
-    entry.push_str("Type=Application\n");
-    entry.push_str("Name=");
-    entry.push_str(&desktop_value(&game.title));
-    entry.push('\n');
-    entry.push_str("Exec=gamectl --manifest ");
-    entry.push_str(&desktop_exec_arg(manifest_path));
-    entry.push_str(" play ");
-    entry.push_str(&desktop_exec_arg(Path::new(&game.id)));
-    entry.push('\n');
-    entry.push_str("Path=");
-    entry.push_str(&desktop_value(&game.work_dir.display().to_string()));
-    entry.push('\n');
-    entry.push_str("Terminal=");
-    entry.push_str(if game.terminal { "true" } else { "false" });
-    entry.push('\n');
-    if let Some(icon) = &game.icon {
-        entry.push_str("Icon=");
-        entry.push_str(&desktop_value(&icon.display().to_string()));
-        entry.push('\n');
-    }
-    entry.push_str("Categories=Game;\n");
-    entry
-}
-
 fn starter_manifest(root: &str) -> String {
     let root = toml_string(root);
     format!(
@@ -1328,16 +1162,6 @@ fn toml_string(value: &str) -> String {
         .replace('"', "\\\"")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
-}
-
-fn parse_env_pair(value: &str) -> Result<(String, String), String> {
-    let Some((key, value)) = value.split_once('=') else {
-        return Err("expected KEY=VALUE".to_owned());
-    };
-    if key.is_empty() {
-        return Err("environment key cannot be empty".to_owned());
-    }
-    Ok((key.to_owned(), value.to_owned()))
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -1890,30 +1714,6 @@ fn shell_quote(value: &str) -> String {
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
     }
-}
-
-fn desktop_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('\r', "")
-}
-
-fn desktop_exec_arg(value: &Path) -> String {
-    shell_quote(&value.display().to_string()).replace('%', "%%")
-}
-
-fn sanitize_filename(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
