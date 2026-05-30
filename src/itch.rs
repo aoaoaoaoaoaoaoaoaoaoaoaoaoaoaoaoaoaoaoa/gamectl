@@ -2,10 +2,10 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsStr,
-    fs,
+    fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
     net::TcpStream,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
 };
@@ -25,7 +25,9 @@ const ITCH_BUTLER_ARCHIVE: &str =
     "https://broth.itch.zone/butler/linux-amd64/LATEST/archive/default";
 const ITCH_BUTLER_LATEST: &str = "https://broth.itch.zone/butler/linux-amd64/LATEST";
 const ITCH_LUTRIS_API_KEY: &str = "~/.cache/lutris/itchio/api-key";
+const ITCH_LUTRIS_COOKIE_JAR: &str = "~/.cache/lutris/.itchio.auth";
 const ITCH_LUTRIS_GAMES: &str = "~/.config/lutris/games";
+const BUTLER_DB_FILES: &[&str] = &["butler.db", "butler.db-wal", "butler.db-shm"];
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ItchAction {
@@ -223,8 +225,17 @@ async fn run_itch_auth(command: ItchAuthAction, paths: &RuntimePaths) -> Result<
         ItchAuthAction::ImportLutris { path, no_sandbox } => {
             let path = normalize_path(path, &paths.home, Path::new("."));
             if !path.exists() {
+                if let Some(preserved) =
+                    preserve_lutris_itch_auth(paths, PathBuf::from(ITCH_LUTRIS_COOKIE_JAR))?
+                {
+                    bail!(
+                        "Lutris itch.io API key not found at {}; preserved Lutris browser cookie jar at {}. Butlerd cannot consume browser cookies directly; create an itch API key and run `gamectl itch auth login-key --key-file PATH`.",
+                        path.display(),
+                        preserved.display()
+                    );
+                }
                 bail!(
-                    "Lutris itch.io API key not found at {}; Lutris appears to have only browser cookies/cache, which butlerd cannot import. Create an itch API key and run `gamectl itch auth login-key --key-file PATH`.",
+                    "Lutris itch.io API key not found at {}; Lutris appears to have no reusable API key or browser cookie jar. Create an itch API key and run `gamectl itch auth login-key --key-file PATH`.",
                     path.display()
                 );
             }
@@ -263,6 +274,7 @@ async fn run_itch_auth(command: ItchAuthAction, paths: &RuntimePaths) -> Result<
             Ok(())
         }
         ItchAuthAction::Status { no_sandbox } => {
+            print_itch_auth_paths(paths);
             let mut butler = Butlerd::spawn(paths, !no_sandbox).await?;
             let profiles = butler.call("Profile.List", json!({}))?;
             let profiles = profiles
@@ -290,6 +302,7 @@ struct Butlerd {
     child: Child,
     reader: BufReader<TcpStream>,
     writer: TcpStream,
+    state: PathBuf,
     next_id: u64,
 }
 
@@ -298,7 +311,7 @@ impl Butlerd {
         let butler = ensure_butler(&paths.home, false).await?;
         let state = itch_state_home(&paths.home);
         let cache = itch_cache_home(&paths.home);
-        fs::create_dir_all(&state)?;
+        secure_butler_state(&state)?;
         fs::create_dir_all(&cache)?;
         fs::create_dir_all(&paths.root)?;
 
@@ -350,9 +363,11 @@ impl Butlerd {
             child,
             reader,
             writer,
+            state,
             next_id: 1,
         };
         let _auth = this.call("Meta.Authenticate", json!({ "secret": secret }))?;
+        secure_butler_state(&this.state)?;
         Ok(this)
     }
 
@@ -541,6 +556,7 @@ impl Drop for Butlerd {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = secure_butler_state(&self.state);
     }
 }
 
@@ -572,6 +588,8 @@ fn sandboxed_butler_command(
         "CapabilityBoundingSet=",
         "-p",
         "RestrictSUIDSGID=yes",
+        "-p",
+        "UMask=0077",
         "-p",
         "LockPersonality=yes",
         "-p",
@@ -613,7 +631,7 @@ fn add_butler_daemon_tail(command: &mut Command, state: &Path) {
     ]);
     let _command = command.arg(std::process::id().to_string());
     let _command = command.arg("--dbpath");
-    let _command = command.arg(state.join("butler.db"));
+    let _command = command.arg(butler_db_path(state));
 }
 
 async fn ensure_butler(home: &Path, force: bool) -> Result<PathBuf> {
@@ -685,6 +703,79 @@ fn read_secret_file(path: &Path) -> Result<String> {
         bail!("{} is empty", path.display());
     }
     Ok(secret)
+}
+
+fn print_itch_auth_paths(paths: &RuntimePaths) {
+    let state = itch_state_home(&paths.home);
+    println!("state_dir: {}", state.display());
+    println!("profile_db: {}", butler_db_path(&state).display());
+    println!("cache_dir: {}", itch_cache_home(&paths.home).display());
+
+    let preserved = preserved_lutris_cookie_path(&paths.home);
+    if preserved.exists() {
+        println!("preserved_lutris_cookie_jar: {}", preserved.display());
+    }
+}
+
+fn preserve_lutris_itch_auth(paths: &RuntimePaths, cookie_jar: PathBuf) -> Result<Option<PathBuf>> {
+    let source = normalize_path(cookie_jar, &paths.home, Path::new("."));
+    if !source.exists() {
+        return Ok(None);
+    }
+
+    let target = preserved_lutris_cookie_path(&paths.home);
+    copy_private_file(&source, &target)?;
+    Ok(Some(target))
+}
+
+fn preserved_lutris_cookie_path(home: &Path) -> PathBuf {
+    itch_state_home(home).join("lutris").join("itchio.auth")
+}
+
+fn copy_private_file(source: &Path, target: &Path) -> Result<()> {
+    let raw = fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
+    write_private_file(target, &raw)
+}
+
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(bytes)?;
+    secure_private_file(path)
+}
+
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to chmod 0700 {}", path.display()))
+}
+
+fn secure_private_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn secure_butler_state(state: &Path) -> Result<()> {
+    create_private_dir_all(state)?;
+    for name in BUTLER_DB_FILES {
+        secure_private_file(&state.join(name))?;
+    }
+    Ok(())
+}
+
+fn butler_db_path(state: &Path) -> PathBuf {
+    state.join("butler.db")
 }
 
 fn import_lutris_itch_games(paths: &RuntimePaths, games_dir: PathBuf, force: bool) -> Result<()> {

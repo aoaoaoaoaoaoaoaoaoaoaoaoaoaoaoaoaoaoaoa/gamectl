@@ -6,7 +6,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     marker::PhantomData,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -367,7 +367,7 @@ enum GogAction {
 
 #[derive(Debug, Subcommand)]
 enum GogAuthAction {
-    /// Import an existing Lutris GOG token into gamectl's private config.
+    /// Import an existing Lutris GOG token into gamectl's private XDG state.
     ImportLutris {
         #[arg(long, default_value = "~/.cache/lutris/.gog.token")]
         path: PathBuf,
@@ -1332,15 +1332,22 @@ const fn is_false(value: &bool) -> bool {
 #[derive(Debug)]
 struct TokenFile<T> {
     path: PathBuf,
+    legacy_paths: Vec<PathBuf>,
     _marker: PhantomData<T>,
 }
 
 impl<T> TokenFile<T> {
     fn new(home: &Path, store: &str) -> Self {
         Self {
-            path: xdg_config_home(home)
+            path: xdg_state_home(home)
                 .join("gamectl")
+                .join("auth")
                 .join(format!("{store}-token.json")),
+            legacy_paths: vec![
+                xdg_config_home(home)
+                    .join("gamectl")
+                    .join(format!("{store}-token.json")),
+            ],
             _marker: PhantomData,
         }
     }
@@ -1350,7 +1357,21 @@ impl<T> TokenFile<T> {
     }
 
     fn exists(&self) -> bool {
-        self.path.exists()
+        self.path.exists() || self.legacy_paths.iter().any(|path| path.exists())
+    }
+
+    fn ensure_current(&self) -> Result<()> {
+        if self.path.exists() {
+            secure_private_file(&self.path)?;
+            return Ok(());
+        }
+
+        if let Some(legacy_path) = self.legacy_paths.iter().find(|path| path.exists()) {
+            let raw = fs::read(legacy_path)
+                .with_context(|| format!("failed to read {}", legacy_path.display()))?;
+            write_private_bytes(&self.path, &raw)?;
+        }
+        Ok(())
     }
 }
 
@@ -1359,6 +1380,7 @@ where
     T: DeserializeOwned,
 {
     fn read(&self) -> Result<T> {
+        self.ensure_current()?;
         if !self.exists() {
             bail!("token missing: {}", self.path.display());
         }
@@ -1374,20 +1396,39 @@ where
     T: Serialize,
 {
     fn write(&self, token: &T) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&self.path)
-            .with_context(|| format!("failed to write {}", self.path.display()))?;
-        file.write_all(serde_json::to_string_pretty(token)?.as_bytes())?;
-        file.write_all(b"\n")?;
-        Ok(())
+        let mut raw = serde_json::to_string_pretty(token)?.into_bytes();
+        raw.push(b'\n');
+        write_private_bytes(&self.path, &raw)
     }
+}
+
+fn create_private_dir_all(path: &Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("failed to chmod 0700 {}", path.display()))
+}
+
+fn secure_private_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod 0600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        create_private_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.write_all(bytes)?;
+    secure_private_file(path)
 }
 
 fn token_expired_error() -> color_eyre::eyre::Report {
@@ -1757,6 +1798,13 @@ fn xdg_config_home(home: &Path) -> PathBuf {
         .unwrap_or_else(|| home.join(".config"))
 }
 
+fn xdg_state_home(home: &Path) -> PathBuf {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".local").join("state"))
+}
+
 fn expand_path(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         return home.to_path_buf();
@@ -1958,9 +2006,45 @@ mod tests {
         let token_file = TokenFile::<TestToken>::new(dir.path(), "test");
         token_file.write(&token)?;
 
+        assert_eq!(
+            token_file.path(),
+            dir.path()
+                .join(".local")
+                .join("state")
+                .join("gamectl")
+                .join("auth")
+                .join("test-token.json")
+        );
+        let parent = token_file.path().parent().unwrap_or(dir.path());
+        let parent_mode = fs::metadata(parent)?.permissions().mode() & 0o777;
+        assert_eq!(parent_mode, 0o700);
         let mode = fs::metadata(token_file.path())?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(token_file.read()?, token);
+        Ok(())
+    }
+
+    #[test]
+    fn token_file_migrates_legacy_config_json_to_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = dir
+            .path()
+            .join(".config")
+            .join("gamectl")
+            .join("test-token.json");
+        fs::create_dir_all(legacy.parent().unwrap_or(dir.path()))?;
+        fs::write(&legacy, r#"{"value":"old-secret"}"#)?;
+
+        let token_file = TokenFile::<TestToken>::new(dir.path(), "test");
+        assert_eq!(
+            token_file.read()?,
+            TestToken {
+                value: "old-secret".to_owned()
+            }
+        );
+        assert!(token_file.path().exists());
+        let mode = fs::metadata(token_file.path())?.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         Ok(())
     }
 
