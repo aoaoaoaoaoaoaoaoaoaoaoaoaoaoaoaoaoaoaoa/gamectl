@@ -18,6 +18,10 @@ use md5::{Digest, Md5};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+mod itch;
+
+use itch::{ItchAction, run_itch};
+
 const CONFIG_ENV: &str = "GAMECTL_CONFIG";
 const DEFAULT_MANIFEST_RELATIVE: &str = "manifests/games.toml";
 const DEFAULT_ROOT: &str = "~/media/games";
@@ -26,7 +30,7 @@ const ROOT_ENV: &str = "GAMECTL_ROOT";
 const GOG_CLIENT_ID: &str = "46899977096215655";
 const GOG_CLIENT_SECRET: &str = "9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9";
 const GOG_REDIRECT_URI: &str = "https://embed.gog.com/on_login_success?origin=client";
-const USER_AGENT: &str = concat!("gamectl/", env!("CARGO_PKG_VERSION"));
+pub(crate) const USER_AGENT: &str = concat!("gamectl/", env!("CARGO_PKG_VERSION"));
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,6 +70,7 @@ impl Cli {
                 show_game(&resolved, json)
             }
             Action::Gog { command } => run_gog(command, &paths).await,
+            Action::Itch { command } => run_itch(command, &paths).await,
             Action::Register(args) => {
                 register_game(&paths.manifest_path, &paths.home, &paths.root, args)
             }
@@ -143,11 +148,11 @@ impl Cli {
 }
 
 #[derive(Debug)]
-struct RuntimePaths {
-    home: PathBuf,
+pub(crate) struct RuntimePaths {
+    pub(crate) home: PathBuf,
     config_path: PathBuf,
-    root: PathBuf,
-    manifest_path: PathBuf,
+    pub(crate) root: PathBuf,
+    pub(crate) manifest_path: PathBuf,
 }
 
 impl RuntimePaths {
@@ -230,6 +235,12 @@ enum Action {
     Gog {
         #[command(subcommand)]
         command: GogAction,
+    },
+
+    /// Install and update native Linux games from itch.io.
+    Itch {
+        #[command(subcommand)]
+        command: ItchAction,
     },
 
     /// Launch a native Linux game.
@@ -1866,7 +1877,7 @@ fn sanitize_filename(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::PermissionsExt;
 
     #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
     struct TestToken {
