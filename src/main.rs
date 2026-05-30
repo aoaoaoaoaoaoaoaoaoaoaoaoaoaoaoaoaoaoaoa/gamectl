@@ -18,9 +18,11 @@ use md5::{Digest, Md5};
 use reqwest::{Client as HttpClient, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-const DEFAULT_MANIFEST: &str = "~/Games/manifests/games.toml";
-const DEFAULT_ROOT: &str = "~/Games";
+const CONFIG_ENV: &str = "GAMECTL_CONFIG";
+const DEFAULT_MANIFEST_RELATIVE: &str = "manifests/games.toml";
+const DEFAULT_ROOT: &str = "~/media/games";
 const MANIFEST_ENV: &str = "GAMECTL_MANIFEST";
+const ROOT_ENV: &str = "GAMECTL_ROOT";
 const GOG_CLIENT_ID: &str = "46899977096215655";
 const GOG_CLIENT_SECRET: &str = "9d85c43b1482497dbbce61f6e4aa173a433796eeae2ca8c5f6129f2dc4de46d9";
 const GOG_REDIRECT_URI: &str = "https://embed.gog.com/on_login_success?origin=client";
@@ -36,7 +38,13 @@ async fn main() -> Result<()> {
 #[command(version, about)]
 struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    #[arg(long, global = true, value_name = "PATH")]
     manifest: Option<PathBuf>,
+
+    #[arg(long, global = true, value_name = "PATH")]
+    root: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Action,
@@ -44,28 +52,29 @@ struct Cli {
 
 impl Cli {
     async fn run(self) -> Result<()> {
-        let home = home_dir()?;
-        let manifest_path = self.manifest_path(&home);
+        let paths = RuntimePaths::resolve(&self)?;
 
         match self.command {
-            Action::Init { root, force } => init_manifest(&manifest_path, &home, root, force),
+            Action::Init { force } => init_manifest(&paths.manifest_path, &paths.root, force),
             Action::List { json } => {
-                let manifest = Manifest::load(&manifest_path, &home)?;
+                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
                 list_games(&manifest, json)
             }
             Action::Show { game, json } => {
-                let manifest = Manifest::load(&manifest_path, &home)?;
+                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
                 let resolved = manifest.resolve_game(&game)?;
                 show_game(&resolved, json)
             }
-            Action::Gog { command } => run_gog(command, &manifest_path, &home).await,
-            Action::Register(args) => register_game(&manifest_path, &home, args),
+            Action::Gog { command } => run_gog(command, &paths).await,
+            Action::Register(args) => {
+                register_game(&paths.manifest_path, &paths.home, &paths.root, args)
+            }
             Action::Launch {
                 game,
                 dry_run,
                 args,
             } => {
-                let manifest = Manifest::load(&manifest_path, &home)?;
+                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
                 let resolved = manifest.resolve_game(&game)?;
                 let mut invocation = resolved.launch_invocation()?;
                 invocation.argv.extend(args.into_iter().map(PathText::from));
@@ -76,7 +85,7 @@ impl Cli {
                 hook,
                 dry_run,
             } => {
-                let manifest = Manifest::load(&manifest_path, &home)?;
+                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
                 let resolved = manifest.resolve_game(&game)?;
                 fs::create_dir_all(&resolved.work_dir)?;
                 let invocation = resolved.hook_invocation(hook)?;
@@ -87,25 +96,105 @@ impl Cli {
                 output,
                 print,
             } => {
-                let manifest = Manifest::load(&manifest_path, &home)?;
+                let manifest = Manifest::load(&paths.manifest_path, &paths.home, &paths.root)?;
                 let resolved = manifest.resolve_game(&game)?;
-                write_desktop_entry(&resolved, &manifest_path, output, print, &home)
+                write_desktop_entry(&resolved, &paths.manifest_path, output, print, &paths.home)
             }
             Action::Paths => {
-                print_paths(&manifest_path, &home);
+                print_paths(&paths);
                 Ok(())
             }
         }
     }
 
-    fn manifest_path(&self, home: &Path) -> PathBuf {
+    fn config_path(&self, home: &Path) -> PathBuf {
+        if let Some(path) = &self.config {
+            return normalize_path(path, home, Path::new("."));
+        }
+        if let Some(path) = env::var_os(CONFIG_ENV) {
+            return normalize_path(PathBuf::from(path), home, Path::new("."));
+        }
+        xdg_config_home(home).join("gamectl").join("config.toml")
+    }
+
+    fn root_path(&self, config: &GamectlConfig, home: &Path) -> PathBuf {
+        if let Some(path) = &self.root {
+            return normalize_path(path, home, Path::new("."));
+        }
+        if let Some(path) = env::var_os(ROOT_ENV) {
+            return normalize_path(PathBuf::from(path), home, Path::new("."));
+        }
+        config
+            .root_path(home)
+            .unwrap_or_else(|| expand_path(DEFAULT_ROOT, home))
+    }
+
+    fn manifest_path(&self, config: &GamectlConfig, home: &Path, root: &Path) -> PathBuf {
         if let Some(path) = &self.manifest {
             return normalize_path(path, home, Path::new("."));
         }
         if let Some(path) = env::var_os(MANIFEST_ENV) {
             return normalize_path(PathBuf::from(path), home, Path::new("."));
         }
-        expand_path(DEFAULT_MANIFEST, home)
+        config
+            .manifest_path(home, root)
+            .unwrap_or_else(|| root.join(DEFAULT_MANIFEST_RELATIVE))
+    }
+}
+
+#[derive(Debug)]
+struct RuntimePaths {
+    home: PathBuf,
+    config_path: PathBuf,
+    root: PathBuf,
+    manifest_path: PathBuf,
+}
+
+impl RuntimePaths {
+    fn resolve(cli: &Cli) -> Result<Self> {
+        let home = home_dir()?;
+        let config_path = cli.config_path(&home);
+        let config = GamectlConfig::load(&config_path)?;
+        let root = cli.root_path(&config, &home);
+        let manifest_path = cli.manifest_path(&config, &home, &root);
+        Ok(Self {
+            home,
+            config_path,
+            root,
+            manifest_path,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct GamectlConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<PathBuf>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manifest: Option<PathBuf>,
+}
+
+impl GamectlConfig {
+    fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+    }
+
+    fn root_path(&self, home: &Path) -> Option<PathBuf> {
+        self.root
+            .as_deref()
+            .map(|path| normalize_path(path, home, Path::new(".")))
+    }
+
+    fn manifest_path(&self, home: &Path, root: &Path) -> Option<PathBuf> {
+        self.manifest
+            .as_deref()
+            .map(|path| normalize_path(path, home, root))
     }
 }
 
@@ -113,10 +202,6 @@ impl Cli {
 enum Action {
     /// Create a starter manifest and base game directories.
     Init {
-        /// Game root written into the manifest.
-        #[arg(long, default_value = DEFAULT_ROOT)]
-        root: PathBuf,
-
         /// Overwrite an existing manifest.
         #[arg(long)]
         force: bool,
@@ -251,9 +336,6 @@ enum GogAction {
     Install {
         product: String,
 
-        #[arg(long, default_value = DEFAULT_ROOT)]
-        root: PathBuf,
-
         #[arg(long, default_value = "linux")]
         os: String,
 
@@ -333,24 +415,24 @@ impl Manifest {
         }
     }
 
-    fn load(path: &Path, home: &Path) -> Result<Self> {
+    fn load(path: &Path, home: &Path, fallback_root: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let mut manifest: Self =
             toml::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))?;
         manifest.home = home.to_path_buf();
         manifest.root_resolved = manifest.root.as_deref().map_or_else(
-            || expand_path(DEFAULT_ROOT, home),
+            || fallback_root.to_path_buf(),
             |path| normalize_path(path, home, Path::new(".")),
         );
         Ok(manifest)
     }
 
-    fn load_or_empty(path: &Path, home: &Path, root: PathBuf) -> Result<Self> {
+    fn load_or_empty(path: &Path, home: &Path, root: &Path) -> Result<Self> {
         if path.exists() {
-            Self::load(path, home)
+            Self::load(path, home, root)
         } else {
-            Ok(Self::empty(root, home))
+            Ok(Self::empty(root.to_path_buf(), home))
         }
     }
 
@@ -627,8 +709,8 @@ fn show_game(game: &ResolvedGame, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn register_game(path: &Path, home: &Path, args: RegisterArgs) -> Result<()> {
-    let mut manifest = Manifest::load(path, home)?;
+fn register_game(path: &Path, home: &Path, fallback_root: &Path, args: RegisterArgs) -> Result<()> {
+    let mut manifest = Manifest::load(path, home, fallback_root)?;
     if manifest.games.contains_key(&args.id) && !args.force {
         bail!("`{}` already exists; pass --force to replace it", args.id);
     }
@@ -662,21 +744,21 @@ fn upsert_manifest_game(
     id: String,
     game: Game,
 ) -> Result<()> {
-    let mut manifest = Manifest::load_or_empty(path, home, root.display().to_string().into())?;
+    let mut manifest = Manifest::load_or_empty(path, home, root)?;
     let _old = manifest.games.insert(id, game);
     manifest.save(path)
 }
 
-async fn run_gog(action: GogAction, manifest_path: &Path, home: &Path) -> Result<()> {
+async fn run_gog(action: GogAction, paths: &RuntimePaths) -> Result<()> {
     match action {
-        GogAction::Auth { command } => run_gog_auth(command, home).await,
+        GogAction::Auth { command } => run_gog_auth(command, &paths.home).await,
         GogAction::Info {
             product,
             os,
             language,
             json,
         } => {
-            let mut client = GogClient::new(home)?;
+            let mut client = GogClient::new(&paths.home)?;
             let selection = client.select_installer(&product, &os, &language).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&selection)?);
@@ -694,28 +776,32 @@ async fn run_gog(action: GogAction, manifest_path: &Path, home: &Path) -> Result
         }
         GogAction::Install {
             product,
-            root,
             os,
             language,
             id,
             force,
             no_sandbox,
         } => {
-            let root = normalize_path(root, home, Path::new("."));
-            let mut client = GogClient::new(home)?;
+            let mut client = GogClient::new(&paths.home)?;
             let selection = client.select_installer(&product, &os, &language).await?;
             let game_id = id.unwrap_or_else(|| flatten_slug(&selection.product.slug));
             let install = client
-                .download_and_extract(&selection, &root, &game_id, force, !no_sandbox)
+                .download_and_extract(&selection, &paths.root, &game_id, force, !no_sandbox)
                 .await?;
-            upsert_manifest_game(manifest_path, home, &root, game_id.clone(), install.game)?;
+            upsert_manifest_game(
+                &paths.manifest_path,
+                &paths.home,
+                &paths.root,
+                game_id.clone(),
+                install.game,
+            )?;
             println!(
                 "installed {} {} at {}",
                 selection.product.title,
                 selection.installer.version,
                 install.target.display()
             );
-            println!("registered {game_id} in {}", manifest_path.display());
+            println!("registered {game_id} in {}", paths.manifest_path.display());
             Ok(())
         }
     }
@@ -1104,7 +1190,7 @@ struct InstalledPlayTask {
     kind: String,
 }
 
-fn init_manifest(path: &Path, home: &Path, root: PathBuf, force: bool) -> Result<()> {
+fn init_manifest(path: &Path, root: &Path, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!(
             "{} already exists; pass --force to overwrite",
@@ -1113,7 +1199,6 @@ fn init_manifest(path: &Path, home: &Path, root: PathBuf, force: bool) -> Result
     }
 
     let root_text = root.display().to_string();
-    let root = normalize_path(&root, home, Path::new("."));
     for subdir in ["library", "manifests", "bin", "saves"] {
         fs::create_dir_all(root.join(subdir))?;
     }
@@ -1126,9 +1211,10 @@ fn init_manifest(path: &Path, home: &Path, root: PathBuf, force: bool) -> Result
     Ok(())
 }
 
-fn print_paths(manifest_path: &Path, home: &Path) {
-    println!("manifest: {}", manifest_path.display());
-    println!("root: {}", expand_path(DEFAULT_ROOT, home).display());
+fn print_paths(paths: &RuntimePaths) {
+    println!("config: {}", paths.config_path.display());
+    println!("manifest: {}", paths.manifest_path.display());
+    println!("root: {}", paths.root.display());
 }
 
 fn write_desktop_entry(
@@ -1241,8 +1327,7 @@ struct TokenFile<T> {
 impl<T> TokenFile<T> {
     fn new(home: &Path, store: &str) -> Self {
         Self {
-            path: home
-                .join(".config")
+            path: xdg_config_home(home)
                 .join("gamectl")
                 .join(format!("{store}-token.json")),
             _marker: PhantomData,
@@ -1654,6 +1739,13 @@ fn home_dir() -> Result<PathBuf> {
         .ok_or_else(|| eyre!("HOME is not set"))
 }
 
+fn xdg_config_home(home: &Path) -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| home.join(".config"))
+}
+
 fn expand_path(path: &str, home: &Path) -> PathBuf {
     if path == "~" {
         return home.to_path_buf();
@@ -1823,9 +1915,27 @@ mod tests {
         assert_eq!(game.title, "Example Native Game");
         assert_eq!(
             game.install_dir,
-            PathBuf::from("/home/alice/Games/library/manual/example")
+            PathBuf::from("/home/alice/media/games/library/manual/example")
         );
         Ok(())
+    }
+
+    #[test]
+    fn config_root_drives_relative_manifest_paths() {
+        let home = Path::new("/home/alice");
+        let config = GamectlConfig {
+            root: Some(PathBuf::from("~/media/games")),
+            manifest: Some(PathBuf::from("manifests/games.toml")),
+        };
+        let root = config.root_path(home).unwrap_or_default();
+
+        assert_eq!(root, PathBuf::from("/home/alice/media/games"));
+        assert_eq!(
+            config.manifest_path(home, &root),
+            Some(PathBuf::from(
+                "/home/alice/media/games/manifests/games.toml"
+            ))
+        );
     }
 
     #[test]
@@ -1889,7 +1999,7 @@ mod tests {
             test_game("beta"),
         )?;
 
-        let loaded = Manifest::load(&manifest, dir.path())?;
+        let loaded = Manifest::load(&manifest, dir.path(), &root)?;
         assert!(loaded.games.contains_key("alpha"));
         assert!(loaded.games.contains_key("beta"));
         Ok(())
