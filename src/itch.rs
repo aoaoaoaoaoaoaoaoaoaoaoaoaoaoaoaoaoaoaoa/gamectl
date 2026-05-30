@@ -229,13 +229,13 @@ async fn run_itch_auth(command: ItchAuthAction, paths: &RuntimePaths) -> Result<
                     preserve_lutris_itch_auth(paths, PathBuf::from(ITCH_LUTRIS_COOKIE_JAR))?
                 {
                     bail!(
-                        "Lutris itch.io API key not found at {}; preserved Lutris browser cookie jar at {}. Butlerd cannot consume browser cookies directly; create an itch API key and run `gamectl itch auth login-key --key-file PATH`.",
+                        "Lutris itch.io API key not found at {}; preserved Lutris browser cookie jar at {}. Butlerd cannot consume browser cookies directly; create an itch API key and run `gamectl store itch auth login-key --key-file PATH`.",
                         path.display(),
                         preserved.display()
                     );
                 }
                 bail!(
-                    "Lutris itch.io API key not found at {}; Lutris appears to have no reusable API key or browser cookie jar. Create an itch API key and run `gamectl itch auth login-key --key-file PATH`.",
+                    "Lutris itch.io API key not found at {}; Lutris appears to have no reusable API key or browser cookie jar. Create an itch API key and run `gamectl store itch auth login-key --key-file PATH`.",
                     path.display()
                 );
             }
@@ -430,7 +430,7 @@ impl Butlerd {
             .and_then(Value::as_array)
             .ok_or_else(|| eyre!("Profile.List returned no profiles array"))?;
         let profile = profiles.first().ok_or_else(|| {
-            eyre!("no itch.io profile saved; run `gamectl itch auth import-lutris` or `gamectl itch auth login-key --key-file PATH`")
+            eyre!("no itch.io profile saved; run `gamectl store itch auth import-lutris` or `gamectl store itch auth login-key --key-file PATH`")
         })?;
         let profile_id = json_u64(profile, "id")?;
         let _validated = self.call("Profile.UseSavedLogin", json!({ "profileId": profile_id }))?;
@@ -928,6 +928,7 @@ fn manifest_game_from_itch(title: &str, game_id: &str, root: &Path, target: &Pat
         terminal: false,
         install: Some(CommandSpec::Argv(vec![
             PathText::from("gamectl"),
+            PathText::from("store"),
             PathText::from("itch"),
             PathText::from("install"),
             PathText::from(game_id.to_owned()),

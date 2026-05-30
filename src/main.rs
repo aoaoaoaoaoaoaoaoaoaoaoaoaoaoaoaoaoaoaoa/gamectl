@@ -69,12 +69,11 @@ impl Cli {
                 let resolved = manifest.resolve_game(&game)?;
                 show_game(&resolved, json)
             }
-            Action::Gog { command } => run_gog(command, &paths).await,
-            Action::Itch { command } => run_itch(command, &paths).await,
+            Action::Store { command } => run_store(command, &paths).await,
             Action::Register(args) => {
                 register_game(&paths.manifest_path, &paths.home, &paths.root, args)
             }
-            Action::Launch {
+            Action::Play {
                 game,
                 dry_run,
                 args,
@@ -85,7 +84,7 @@ impl Cli {
                 invocation.argv.extend(args.into_iter().map(PathText::from));
                 run_invocation(invocation, dry_run)
             }
-            Action::Run {
+            Action::Hook {
                 game,
                 hook,
                 dry_run,
@@ -231,20 +230,14 @@ enum Action {
     /// Add or replace one manifest entry.
     Register(RegisterArgs),
 
-    /// Install and update native Linux games from GOG offline installers.
-    Gog {
+    /// Install, update, and authenticate through game stores.
+    Store {
         #[command(subcommand)]
-        command: GogAction,
+        command: StoreAction,
     },
 
-    /// Install and update native Linux games from itch.io.
-    Itch {
-        #[command(subcommand)]
-        command: ItchAction,
-    },
-
-    /// Launch a native Linux game.
-    Launch {
+    /// Play a native Linux game.
+    Play {
         game: String,
 
         /// Print the command without executing it.
@@ -256,8 +249,8 @@ enum Action {
         args: Vec<OsString>,
     },
 
-    /// Run a configured install/update/repair hook.
-    Run {
+    /// Execute a configured install/update/repair hook.
+    Hook {
         game: String,
         hook: Hook,
 
@@ -281,6 +274,21 @@ enum Action {
 
     /// Print default paths used by gamectl.
     Paths,
+}
+
+#[derive(Debug, Subcommand)]
+enum StoreAction {
+    /// Native Linux games from GOG offline installers.
+    Gog {
+        #[command(subcommand)]
+        command: GogAction,
+    },
+
+    /// Native Linux games from itch.io.
+    Itch {
+        #[command(subcommand)]
+        command: ItchAction,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -818,6 +826,13 @@ async fn run_gog(action: GogAction, paths: &RuntimePaths) -> Result<()> {
     }
 }
 
+async fn run_store(action: StoreAction, paths: &RuntimePaths) -> Result<()> {
+    match action {
+        StoreAction::Gog { command } => run_gog(command, paths).await,
+        StoreAction::Itch { command } => run_itch(command, paths).await,
+    }
+}
+
 async fn run_gog_auth(command: GogAuthAction, home: &Path) -> Result<()> {
     let token_file = TokenFile::<GogToken>::new(home, "gog");
     match command {
@@ -841,7 +856,7 @@ async fn run_gog_auth(command: GogAuthAction, home: &Path) -> Result<()> {
             } else {
                 println!("{}", gog_login_url());
                 println!("After login, rerun with:");
-                println!("gamectl gog auth login --code '<redirect URL or code>'");
+                println!("gamectl store gog auth login --code '<redirect URL or code>'");
             }
             Ok(())
         }
@@ -864,7 +879,7 @@ async fn run_gog_auth(command: GogAuthAction, home: &Path) -> Result<()> {
             println!("expires_in: {}", expires_at.saturating_sub(now));
             if state == "expired" {
                 println!(
-                    "note: commands will try the stored refresh token; if refresh fails, rerun `gamectl gog auth login`"
+                    "note: commands will try the stored refresh token; if refresh fails, rerun `gamectl store gog auth login`"
                 );
             }
             if let Some(user_id) = token.user_id {
@@ -1018,7 +1033,7 @@ impl GogClient {
         let token_file = TokenFile::<GogToken>::new(&self.home, "gog");
         let mut token = token_file
             .read()
-            .wrap_err("GOG token missing or unreadable. Run `gamectl gog auth import-lutris` or `gamectl gog auth login`.")?;
+            .wrap_err("GOG token missing or unreadable. Run `gamectl store gog auth import-lutris` or `gamectl store gog auth login`.")?;
         let now = now_unix();
         if token
             .acquired_at
@@ -1267,7 +1282,7 @@ fn desktop_entry(game: &ResolvedGame, manifest_path: &Path) -> String {
     entry.push('\n');
     entry.push_str("Exec=gamectl --manifest ");
     entry.push_str(&desktop_exec_arg(manifest_path));
-    entry.push_str(" launch ");
+    entry.push_str(" play ");
     entry.push_str(&desktop_exec_arg(Path::new(&game.id)));
     entry.push('\n');
     entry.push_str("Path=");
@@ -1332,7 +1347,6 @@ const fn is_false(value: &bool) -> bool {
 #[derive(Debug)]
 struct TokenFile<T> {
     path: PathBuf,
-    legacy_paths: Vec<PathBuf>,
     _marker: PhantomData<T>,
 }
 
@@ -1343,11 +1357,6 @@ impl<T> TokenFile<T> {
                 .join("gamectl")
                 .join("auth")
                 .join(format!("{store}-token.json")),
-            legacy_paths: vec![
-                xdg_config_home(home)
-                    .join("gamectl")
-                    .join(format!("{store}-token.json")),
-            ],
             _marker: PhantomData,
         }
     }
@@ -1357,21 +1366,7 @@ impl<T> TokenFile<T> {
     }
 
     fn exists(&self) -> bool {
-        self.path.exists() || self.legacy_paths.iter().any(|path| path.exists())
-    }
-
-    fn ensure_current(&self) -> Result<()> {
-        if self.path.exists() {
-            secure_private_file(&self.path)?;
-            return Ok(());
-        }
-
-        if let Some(legacy_path) = self.legacy_paths.iter().find(|path| path.exists()) {
-            let raw = fs::read(legacy_path)
-                .with_context(|| format!("failed to read {}", legacy_path.display()))?;
-            write_private_bytes(&self.path, &raw)?;
-        }
-        Ok(())
+        self.path.exists()
     }
 }
 
@@ -1380,7 +1375,6 @@ where
     T: DeserializeOwned,
 {
     fn read(&self) -> Result<T> {
-        self.ensure_current()?;
         if !self.exists() {
             bail!("token missing: {}", self.path.display());
         }
@@ -1433,7 +1427,7 @@ fn write_private_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn token_expired_error() -> color_eyre::eyre::Report {
     eyre!(
-        "GOG token expired or revoked. Run `gamectl gog auth login` or `gamectl gog auth import-lutris`."
+        "GOG token expired or revoked. Run `gamectl store gog auth login` or `gamectl store gog auth import-lutris`."
     )
 }
 
@@ -1998,6 +1992,52 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_play() -> Result<()> {
+        let cli = Cli::try_parse_from(["gamectl", "play", "songs-of-syx", "--", "--safe"])?;
+        let Action::Play {
+            game,
+            dry_run,
+            args,
+        } = cli.command
+        else {
+            bail!("play did not parse as Action::Play");
+        };
+        assert_eq!(game, "songs-of-syx");
+        assert!(!dry_run);
+        assert_eq!(args, vec![OsString::from("--safe")]);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_hook() -> Result<()> {
+        let cli = Cli::try_parse_from(["gamectl", "hook", "songs-of-syx", "update"])?;
+        let Action::Hook { game, hook, .. } = cli.command else {
+            bail!("hook did not parse as Action::Hook");
+        };
+        assert_eq!(game, "songs-of-syx");
+        assert!(matches!(hook, Hook::Update));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_parses_store_backends() -> Result<()> {
+        let cli = Cli::try_parse_from(["gamectl", "store", "itch", "auth", "status"])?;
+        let Action::Store {
+            command:
+                StoreAction::Itch {
+                    command:
+                        ItchAction::Auth {
+                            command: itch::ItchAuthAction::Status { .. },
+                        },
+                },
+        } = cli.command
+        else {
+            bail!("store itch auth status did not parse as nested itch auth status");
+        };
+        Ok(())
+    }
+
+    #[test]
     fn token_file_writes_private_json() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let token = TestToken {
@@ -2021,30 +2061,6 @@ mod tests {
         let mode = fs::metadata(token_file.path())?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(token_file.read()?, token);
-        Ok(())
-    }
-
-    #[test]
-    fn token_file_migrates_legacy_config_json_to_state() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let legacy = dir
-            .path()
-            .join(".config")
-            .join("gamectl")
-            .join("test-token.json");
-        fs::create_dir_all(legacy.parent().unwrap_or(dir.path()))?;
-        fs::write(&legacy, r#"{"value":"old-secret"}"#)?;
-
-        let token_file = TokenFile::<TestToken>::new(dir.path(), "test");
-        assert_eq!(
-            token_file.read()?,
-            TestToken {
-                value: "old-secret".to_owned()
-            }
-        );
-        assert!(token_file.path().exists());
-        let mode = fs::metadata(token_file.path())?.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
         Ok(())
     }
 
